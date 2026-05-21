@@ -1,0 +1,382 @@
+"""
+Dhan ORB (Opening Range Breakout) Trading Bot
+Strategy: 9:30-10:00 AM box breakout on Nifty 50 with options
+Author: Production Master Framework with Telegram Intercepts
+"""
+
+import time
+import datetime
+import logging
+import requests
+import pandas as pd
+from dhanhq import dhanhq
+
+# ─────────────────────────────────────────────
+# LOGGING & NOTIFICATION PLATFORM
+# ─────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("orb_bot.log"),
+        logging.StreamHandler()
+    ]
+)
+log = logging.getLogger(__name__)
+
+import os
+CLIENT_ID   = os.environ.get("DHAN_CLIENT_ID", "YOUR_DHAN_CLIENT_ID")
+ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN", "YOUR_API_ACCESS_TOKEN")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", 8104915383:AAF9_-rEpLCMv1n1LK_-DUL4LjEHC9YkXdU)
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", 1946046079)
+
+dhan = dhanhq(CLIENT_ID, ACCESS_TOKEN)
+
+# ─────────────────────────────────────────────
+# STRATEGY CONFIGURATION
+# ─────────────────────────────────────────────
+NIFTY_SECURITY_ID  = "13"          # Nifty 50 Index Spot on NSE
+BASE_LOTS          = 15
+REVERSAL_LOTS      = 10
+QTY_PER_LOT        = 65            # 2026 Revised Lot Size 
+MAX_BOX_SIZE       = 250           
+MIN_BOX_SIZE       = 10            
+
+state = {
+    "orb_high":        None,
+    "orb_low":         None,
+    "box_size":        None,
+    "trade_count":     0,
+    "active_position": None,   # "LONG" | "SHORT" | "REV_LONG" | "REV_SHORT" | "FINISHED" | None
+    "half_booked":     False,
+    "entry_price":     0.0,
+    "t1_stopped_out":  None,   
+    "call_security_id": None,
+    "put_security_id":  None,
+}
+
+# ─────────────────────────────────────────────
+# NOTIFICATION MODULE
+# ─────────────────────────────────────────────
+def send_telegram_alert(message: str):
+    """Dispatches a synchronized push text alert string straight to your mobile device."""
+    if TELEGRAM_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN" or TELEGRAM_CHAT_ID == "YOUR_TELEGRAM_CHAT_ID":
+        log.warning(f"Telegram credentials not populated. Log bypass: {message}")
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+        requests.post(url, json=payload, timeout=5)
+    except Exception as network_err:
+        log.error(f"Telegram dispatch failure trace: {network_err}")
+
+# ─────────────────────────────────────────────
+# DATA & RESAMPLING FRAMEWORKS
+# ─────────────────────────────────────────────
+def fetch_1min_candles_raw() -> pd.DataFrame | None:
+    try:
+        data = dhan.intraday_minute_data(
+            security_id=NIFTY_SECURITY_ID, exchange_segment="IDX_I", instrument_type="INDEX"
+        )
+        if not data or data.get("status") != "success":
+            return None
+
+        df = pd.DataFrame(data["data"])
+        df["start_time"] = pd.to_datetime(df["start_time"])
+        df = df[df["start_time"].dt.date == datetime.date.today()]
+        df = df.sort_values("start_time").reset_index(drop=True)
+
+        for col in ["open", "high", "low", "close"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
+    except Exception as e:
+        log.error(f"fetch_1min_candles_raw() error: {e}")
+        return None
+
+def resample_to_15min(df: pd.DataFrame) -> pd.DataFrame | None:
+    try:
+        df = df.set_index("start_time")
+        df_15 = df.resample("15min", offset="15min").agg({
+            "open": "first", "high": "max", "low": "min", "close": "last"
+        }).dropna(subset=["open", "close"])
+        return df_15.reset_index().rename(columns={"index": "start_time"})
+    except Exception as e:
+        log.error(f"resample_to_15min() error: {e}")
+        return None
+
+def fetch_latest_15min_close() -> tuple[float, float, float] | None:
+    raw = fetch_1min_candles_raw()
+    if raw is None or raw.empty: return None
+    df = resample_to_15min(raw)
+    if df is None or df.empty: return None
+
+    cutoff = datetime.datetime.now() - datetime.timedelta(minutes=15)
+    completed = df[df["start_time"] <= cutoff]
+    if completed.empty: return None
+
+    last = completed.iloc[-1]
+    return float(last["close"]), float(last["high"]), float(last["low"])
+
+def extract_orb_range():
+    raw = fetch_1min_candles_raw()
+    if raw is None or raw.empty: return
+
+    raw_orb = raw[(raw["start_time"].dt.time >= datetime.time(9, 30)) & (raw["start_time"].dt.time < datetime.time(10, 0))]
+    if len(raw_orb) < 28:
+        log.warning(f"Incomplete morning range tracking array profile ({len(raw_orb)} bars). Retrying.")
+        return
+
+    df_15 = resample_to_15min(raw)
+    if df_15 is None or df_15.empty: return
+
+    orb_candles = df_15[(df_15["start_time"].dt.time >= datetime.time(9, 30)) & (df_15["start_time"].dt.time < datetime.time(10, 0))]
+    if len(orb_candles) < 2: return
+
+    state["orb_high"] = float(orb_candles["high"].max())
+    state["orb_low"]  = float(orb_candles["low"].min())
+    state["box_size"] = state["orb_high"] - state["orb_low"]
+
+    log.info(f"ORB Box calculated → High: {state['orb_high']} | Low: {state['orb_low']}")
+    send_telegram_alert(f"📦 *ORB Box Formed*\n🟢 High: {state['orb_high']}\n🔴 Low: {state['orb_low']}\n📏 Size: {state['box_size']:.2f} pts")
+
+# ─────────────────────────────────────────────
+# OPTION SECURITY MAPPING
+# ─────────────────────────────────────────────
+def get_nifty_expiry_from_api() -> str | None:
+    try:
+        response = dhan.get_expiry_list(underlying_scrip="NIFTY", exchange_segment="IDX_I")
+        if not response or response.get("status") != "success": return None
+        raw_dates = response.get("data", {}).get("ExpiryDate", [])
+        if not raw_dates: return None
+
+        today = datetime.date.today()
+        expiry_dates = sorted(list(set([pd.to_datetime(d).date() for d in raw_dates])))
+        market_closed = datetime.datetime.now().time() > datetime.time(15, 30)
+
+        for expiry in expiry_dates:
+            if expiry < today or (expiry == today and market_closed): continue
+            return expiry.strftime("%Y-%m-%d")
+        return None
+    except Exception as e:
+        log.error(f"get_nifty_expiry_from_api() fault: {e}")
+        return None
+
+def load_option_security_ids(spot_price: float):
+    try:
+        expiry_str = get_nifty_expiry_from_api()
+        if not expiry_str: return False
+
+        chain = dhan.get_option_chain(underlying_scrip="NIFTY", underlying_seg="IDX_I", expiry=expiry_str)
+        if not chain or chain.get("status") != "success": return False
+
+        atm_strike = round(spot_price / 50) * 50
+        call_strike = atm_strike - 50   # 1 Strike ITM
+        put_strike  = atm_strike + 50   
+
+        options = chain["data"]
+        for opt in options:
+            if opt["strikePrice"] == call_strike and opt["optionType"] == "CALL":
+                state["call_security_id"] = str(opt["securityId"])
+            if opt["strikePrice"] == put_strike and opt["optionType"] == "PUT":
+                state["put_security_id"] = str(opt["securityId"])
+
+        return state["call_security_id"] is not None and state["put_security_id"] is not None
+    except Exception as e:
+        log.error(f"load_option_security_ids() processing exception: {e}")
+        return False
+
+# ─────────────────────────────────────────────
+# ORDER INTERFACE
+# ─────────────────────────────────────────────
+def execute_market_order(transaction_type: str, quantity: int, option_type: str) -> bool:
+    security_id = state["call_security_id"] if option_type == "CALL" else state["put_security_id"]
+    if not security_id: return False
+
+    send_telegram_alert(f"⏳ *Routing Order to Dhan API...*\nAction: {transaction_type}\nQty: {quantity}\nContract Type: {option_type}")
+
+    try:
+        response = dhan.place_order(
+            security_id=security_id, exchange_segment=dhan.NSE_FNO,
+            transaction_type=dhan.BUY if transaction_type == "BUY" else dhan.SELL,
+            quantity=quantity, order_type=dhan.MARKET, product_type="INTRADAY", price=0
+        )
+
+        if response and response.get("status") == "success":
+            send_telegram_alert(f"✅ *ORDER EXECUTED SUCCESS*\nResponse: {response.get('message', 'Filled')}")
+            return True
+        else:
+            send_telegram_alert(f"❌ *ORDER REJECTED BY BROKER*\nPayload: {response}")
+            return False
+    except Exception as api_fault:
+        send_telegram_alert(f"🚨 *CRITICAL EXECUTION EXCEPTION*\nFault Trace: {api_fault}")
+        return False
+
+def close_all_positions():
+    pos = state["active_position"]
+    if pos == "LONG":
+        qty = (BASE_LOTS - (8 if state["half_booked"] else 0)) * QTY_PER_LOT
+        execute_market_order("SELL", qty, "CALL")
+    elif pos == "SHORT":
+        qty = (BASE_LOTS - (8 if state["half_booked"] else 0)) * QTY_PER_LOT
+        execute_market_order("SELL", qty, "PUT")
+    elif pos == "REV_LONG":
+        execute_market_order("SELL", REVERSAL_LOTS * QTY_PER_LOT, "CALL")
+    elif pos == "REV_SHORT":
+        execute_market_order("SELL", REVERSAL_LOTS * QTY_PER_LOT, "PUT")
+    state["active_position"] = "FINISHED"
+
+# ─────────────────────────────────────────────
+# STRATEGY LOGIC ENGINE
+# ─────────────────────────────────────────────
+def run_strategy(last_close: float, last_high: float, last_low: float):
+    s = state
+    orb_high, orb_low, box_size = s["orb_high"], s["orb_low"], s["box_size"]
+
+    if box_size < MIN_BOX_SIZE or box_size > MAX_BOX_SIZE: return
+
+    # ── TRADE 1: BREAKOUT ENTRY CHANNEL ──────────
+    if s["trade_count"] == 0 and s["active_position"] is None:
+        if last_close > orb_high:
+            if not load_option_security_ids(last_close): return
+            if execute_market_order("BUY", BASE_LOTS * QTY_PER_LOT, "CALL"):
+                s["active_position"], s["entry_price"], s["trade_count"], s["half_booked"] = "LONG", last_close, 1, False
+                send_telegram_alert(f"🚀 *TRADE 1 INITIATED: LONG*\nIndex Breakout: {last_close}\nLots: {BASE_LOTS} ({BASE_LOTS * QTY_PER_LOT} Qty)")
+
+        elif last_close < orb_low:
+            if not load_option_security_ids(last_close): return
+            if execute_market_order("BUY", BASE_LOTS * QTY_PER_LOT, "PUT"):
+                s["active_position"], s["entry_price"], s["trade_count"], s["half_booked"] = "SHORT", last_close, 1, False
+                send_telegram_alert(f"🚀 *TRADE 1 INITIATED: SHORT*\nIndex Breakout: {last_close}\nLots: {BASE_LOTS} ({BASE_LOTS * QTY_PER_LOT} Qty)")
+
+    # ── TRADE 1 RISK ROUTINES ───────────────────
+    elif s["trade_count"] == 1 and s["active_position"] == "LONG":
+        target1, trail_stop, stop_loss = s["entry_price"] + (box_size * 2), s["entry_price"] + box_size, orb_low
+
+        if not s["half_booked"] and last_high >= target1:
+            if execute_market_order("SELL", 8 * QTY_PER_LOT, "CALL"):
+                s["half_booked"] = True
+                send_telegram_alert(f"💰 *TARGET 1 ACHIEVED (1:2 RR)*\nBooked Partial Profit: 8 Lots\nRemaining 7 Lots trailing stop shifted to 1:1 level ({trail_stop})")
+
+        if s["half_booked"] and last_close <= trail_stop:
+            execute_market_order("SELL", 7 * QTY_PER_LOT, "CALL")
+            s["active_position"], s["half_booked"] = "FINISHED", False
+            send_telegram_alert("🏁 *TRADE COMPLETE*\nRemaining 7 Lots hit trailing stop at 1:1 profit line. Session locked green.")
+
+        elif not s["half_booked"] and last_close <= stop_loss:
+            execute_market_order("SELL", BASE_LOTS * QTY_PER_LOT, "CALL")
+            s["active_position"], s["half_booked"], s["t1_stopped_out"] = None, False, "LONG_STOPPED"
+            send_telegram_alert(f"💥 *TRADE 1 STOP LOSS HIT*\nWhipsaw breakdown closed full position at {last_close}. Monitoring opposite reversal parameters...")
+
+    elif s["trade_count"] == 1 and s["active_position"] == "SHORT":
+        target1, trail_stop, stop_loss = s["entry_price"] - (box_size * 2), s["entry_price"] - box_size, orb_high
+
+        if not s["half_booked"] and last_low <= target1:
+            if execute_market_order("SELL", 8 * QTY_PER_LOT, "PUT"):
+                s["half_booked"] = True
+                send_telegram_alert(f"💰 *TARGET 1 ACHIEVED (1:2 RR)*\nBooked Partial Profit: 8 Lots\nRemaining 7 Lots trailing stop shifted to 1:1 level ({trail_stop})")
+
+        if s["half_booked"] and last_close >= trail_stop:
+            execute_market_order("SELL", 7 * QTY_PER_LOT, "PUT")
+            s["active_position"], s["half_booked"] = "FINISHED", False
+            send_telegram_alert("🏁 *TRADE COMPLETE*\nRemaining 7 Lots hit trailing stop at 1:1 profit line. Session locked green.")
+
+        elif not s["half_booked"] and last_close >= stop_loss:
+            execute_market_order("SELL", BASE_LOTS * QTY_PER_LOT, "PUT")
+            s["active_position"], s["half_booked"], s["t1_stopped_out"] = None, False, "SHORT_STOPPED"
+            send_telegram_alert(f"💥 *TRADE 1 STOP LOSS HIT*\nWhipsaw breakdown closed full position at {last_close}. Monitoring opposite reversal parameters...")
+
+    # ── TRADE 2: REVERSAL VERIFICATION LOOPS ─────
+    elif s["trade_count"] == 1 and s["active_position"] is None:
+        stopped = s.get("t1_stopped_out")
+
+        if stopped == "LONG_STOPPED" and last_close < orb_low:
+            if execute_market_order("BUY", REVERSAL_LOTS * QTY_PER_LOT, "PUT"):
+                s["active_position"], s["entry_price"], s["trade_count"], s["half_booked"] = "REV_SHORT", last_close, 2, False
+                send_telegram_alert(f"🔄 *TRADE 2 REVERSAL SCALP ENGAGED*\nDirection: SHORT (PUT)\nLots Allocation: {REVERSAL_LOTS} ({REVERSAL_LOTS * QTY_PER_LOT} Qty)")
+
+        elif stopped == "SHORT_STOPPED" and last_close > orb_high:
+            if execute_market_order("BUY", REVERSAL_LOTS * QTY_PER_LOT, "CALL"):
+                s["active_position"], s["entry_price"], s["trade_count"], s["half_booked"] = "REV_LONG", last_close, 2, False
+                send_telegram_alert(f"🔄 *TRADE 2 REVERSAL SCALP ENGAGED*\nDirection: LONG (CALL)\nLots Allocation: {REVERSAL_LOTS} ({REVERSAL_LOTS * QTY_PER_LOT} Qty)")
+
+    # ── TRADE 2 RISK ROUTINES ───────────────────
+    elif s["trade_count"] == 2 and s["active_position"] in ("REV_LONG", "REV_SHORT"):
+        t2_target, t2_stop = box_size * 2, box_size * 0.5
+
+        if s["active_position"] == "REV_LONG":
+            if last_high >= (s["entry_price"] + t2_target):
+                execute_market_order("SELL", REVERSAL_LOTS * QTY_PER_LOT, "CALL")
+                s["active_position"] = "FINISHED"
+                send_telegram_alert("🎯 *TRADE 2 REVERSAL PROFIT TARGET MET*\n10 Lots scaled out successfully at full target line. System done for the day.")
+            elif last_close <= (s["entry_price"] - t2_stop):
+                execute_market_order("SELL", REVERSAL_LOTS * QTY_PER_LOT, "CALL")
+                s["active_position"] = "FINISHED"
+                send_telegram_alert("🛑 *TRADE 2 REVERSAL MIDLINE SL HIT*\nPositions cleaned down at protective boundary. System shutting down.")
+
+        elif s["active_position"] == "REV_SHORT":
+            if last_low <= (s["entry_price"] - t2_target):
+                execute_market_order("SELL", REVERSAL_LOTS * QTY_PER_LOT, "PUT")
+                s["active_position"] = "FINISHED"
+                send_telegram_alert("🎯 *TRADE 2 REVERSAL PROFIT TARGET MET*\n10 Lots scaled out successfully at full target line. System done for the day.")
+            elif last_close >= (s["entry_price"] + t2_stop):
+                execute_market_order("SELL", REVERSAL_LOTS * QTY_PER_LOT, "PUT")
+                s["active_position"] = "FINISHED"
+                send_telegram_alert("🛑 *TRADE 2 REVERSAL MIDLINE SL HIT*\nPositions cleaned down at protective boundary. System shutting down.")
+
+# ─────────────────────────────────────────────
+# RUNTIME LOOP PROCESS
+# ─────────────────────────────────────────────
+def main():
+    log.info("Dhan Bot Infrastructure Launching...")
+    send_telegram_alert("🤖 *Nifty 15-Lot ORB Algorithmic Bot Online*\nStatus: Connected to Dhan Core API. Standing by for market open...")
+    orb_extraction_attempted = False
+
+    while True:
+        try:
+            now = datetime.datetime.now().time()
+
+            if now < datetime.time(9, 30) or (datetime.time(9, 30) <= now < datetime.time(10, 0)):
+                time.sleep(15)
+                continue
+
+            if now >= datetime.time(10, 0) and state["orb_high"] is None:
+                if not orb_extraction_attempted:
+                    extract_orb_range()
+                    orb_extraction_attempted = True
+                if state["orb_high"] is None:
+                    time.sleep(15)
+                    continue
+
+            if now >= datetime.time(15, 15):
+                log.info("Intraday time cutoff reached.")
+                if state["active_position"] not in (None, "FINISHED"):
+                    send_telegram_alert("⏰ *3:15 PM Intraday Cutoff Reached*\nLiquidating outstanding portfolio items via market order.")
+                    close_all_positions()
+                send_telegram_alert("🏁 *System Session Concluded Normally*\nTrading terminal powering down safely. See you tomorrow!")
+                break
+
+            if state["orb_high"] is not None and state["active_position"] != "FINISHED":
+                result = fetch_latest_15min_close()
+                if result is not None:
+                    last_close, last_high, last_low = result
+                    run_strategy(last_close=last_close, last_high=last_high, last_low=last_low)
+                else:
+                    log.warning("Awaiting a fresh completed 15-minute interval bar.")
+
+            elif state["active_position"] == "FINISHED":
+                time.sleep(30)
+                continue
+
+            time.sleep(5)
+
+        except KeyboardInterrupt:
+            send_telegram_alert("⚠️ *Manual System Intercept Detected*\nPowering down cloud engine and clearing outstanding items.")
+            if state["active_position"] not in (None, "FINISHED"): close_all_positions()
+            break
+        except Exception as err:
+            log.error(f"Global master fault trace handled: {err}")
+            time.sleep(10)
+
+if __name__ == "__main__":
+    main()
